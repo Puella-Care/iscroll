@@ -1,4 +1,4 @@
-/*! iScroll v5.2.0-snapshot ~ (c) 2008-2026 Matteo Spinelli ~ http://cubiq.org/license */
+/*! iScroll v5.2.0-snapshot ~ (c) 2008-2017 Matteo Spinelli, (c) 2026 Adjustments from Aniplex/f4samurai ported by LiviaMedeiros ~ http://cubiq.org/license */
 (function (window, document, Math) {
 var rAF = window.requestAnimationFrame	||
 	window.webkitRequestAnimationFrame	||
@@ -40,7 +40,13 @@ var utils = (function () {
 	};
 
 	me.addEvent = function (el, type, fn, capture) {
-		el.addEventListener(type, fn, !!capture);
+		// Ensure non-passive listeners for touchmove/mousemove to allow preventDefault
+		if ( type !== 'touchmove' && type !== 'mousemove' ) {
+			el.addEventListener(type, fn, !!capture);
+		} else {
+			// Use options object to explicitly set passive:false
+			el.addEventListener(type, fn, { passive: false, capture: !!capture });
+		}
 	};
 
 	me.removeEvent = function (el, type, fn, capture) {
@@ -347,6 +353,7 @@ function IScroll (el, options) {
 		HWCompositing: true,
 		useTransition: true,
 		useTransform: true,
+		scrollFit: false,
 		bindToWrapper: typeof window.onmousedown === "undefined"
 	};
 
@@ -400,6 +407,7 @@ function IScroll (el, options) {
 	this.directionX = 0;
 	this.directionY = 0;
 	this._events = {};
+	this.listIndex = 0;
 
 // INSERT POINT: DEFAULTS
 
@@ -513,6 +521,11 @@ IScroll.prototype = {
 		this.pointX    = point.pageX;
 		this.pointY    = point.pageY;
 
+		// initialize fuzzy tracking used by scrollFit/list snapping
+		this.beforePointY = this.beforePointX = null;
+		this.fuzzyDirectionY = this.fuzzyDirectionX = 0;
+		this.intervalTime = utils.getTime();
+
 		this._execEvent('beforeScrollStart');
 	},
 
@@ -540,8 +553,9 @@ IScroll.prototype = {
 		absDistX		= Math.abs(this.distX);
 		absDistY		= Math.abs(this.distY);
 
-		// We need to move at least 10 pixels for the scrolling to initiate
-		if ( timestamp - this.endTime > 300 && (absDistX < 10 && absDistY < 10) ) {
+		// We need to move at least some pixels for the scrolling to initiate
+		// Updated: require previous endTime and larger threshold to ignore tiny moves after a pause.
+		if ( this.endTime && timestamp - this.endTime > 300 && (absDistX < 50 && absDistY < 50) ) {
 			return;
 		}
 
@@ -590,9 +604,6 @@ IScroll.prototype = {
 			newY = this.options.bounce ? this.y + deltaY / 3 : newY > 0 ? 0 : this.maxScrollY;
 		}
 
-		this.directionX = deltaX > 0 ? -1 : deltaX < 0 ? 1 : 0;
-		this.directionY = deltaY > 0 ? -1 : deltaY < 0 ? 1 : 0;
-
 		if ( !this.moved ) {
 			this._execEvent('scrollStart');
 		}
@@ -603,10 +614,34 @@ IScroll.prototype = {
 
 /* REPLACE START: _move */
 
+		// update start reference if enough time passed since touch start
 		if ( timestamp - this.startTime > 300 ) {
 			this.startTime = timestamp;
 			this.startX = this.x;
 			this.startY = this.y;
+		}
+
+		// update movement directions after applying translation
+		this.directionX = deltaX > 0 ? -1 : deltaX < 0 ? 1 : 0;
+		this.directionY = deltaY > 0 ? -1 : deltaY < 0 ? 1 : 0;
+
+		// initialize beforePoint values for fuzzy detection
+		if (!this.beforePointX) this.beforePointX = point.pageX;
+		if (!this.beforePointY) this.beforePointY = point.pageY;
+
+		// fuzzy direction: detect if pointer moved significantly since last interval
+		this.fuzzyDirectionX = Math.abs(this.beforePointX - point.pageX) > 5 ? (this.beforePointX - point.pageX < 0 ? -1 : 1) : this.fuzzyDirectionX;
+		this.fuzzyDirectionY = Math.abs(this.beforePointY - point.pageY) > 5 ? (this.beforePointY - point.pageY < 0 ? -1 : 1) : this.fuzzyDirectionY;
+
+		// periodic interval: refresh start reference and beforePoint markers every 300ms
+		if ( timestamp - this.intervalTime > 300 ) {
+			this.intervalTime = timestamp;
+			this.directionX = deltaX > 0 ? -1 : deltaX < 0 ? 1 : 0;
+			this.directionY = deltaY > 0 ? -1 : deltaY < 0 ? 1 : 0;
+			this.startX = this.x;
+			this.startY = this.y;
+			this.beforePointX = point.pageX;
+			this.beforePointY = point.pageY;
 		}
 
 /* REPLACE END: _move */
@@ -625,7 +660,8 @@ IScroll.prototype = {
 		var point = e.changedTouches ? e.changedTouches[0] : e,
 			momentumX,
 			momentumY,
-			duration = utils.getTime() - this.startTime,
+			// use interval-based duration to better reflect recent movement
+			durationSinceInterval = utils.getTime() - this.intervalTime,
 			newX = Math.round(this.x),
 			newY = Math.round(this.y),
 			distanceX = Math.abs(newX - this.startX),
@@ -644,7 +680,7 @@ IScroll.prototype = {
 
 		this.scrollTo(newX, newY);	// ensures that the last position is rounded
 
-		// we scrolled less than 10 pixels
+		// we scrolled less than thresholds -> treat as tap/click
 		if ( !this.moved ) {
 			if ( this.options.tap ) {
 				utils.tap(e, this.options.tap);
@@ -658,15 +694,16 @@ IScroll.prototype = {
 			return;
 		}
 
-		if ( this._events.flick && duration < 200 && distanceX < 100 && distanceY < 100 ) {
+		// flick detection: stricter thresholds based on recent interval
+		if ( this._events.flick && durationSinceInterval < 50 && distanceX < 30 && distanceY < 30 ) {
 			this._execEvent('flick');
 			return;
 		}
 
-		// start momentum animation if needed
-		if ( this.options.momentum && duration < 300 ) {
-			momentumX = this.hasHorizontalScroll ? utils.momentum(this.x, this.startX, duration, this.maxScrollX, this.options.bounce ? this.wrapperWidth : 0, this.options.deceleration) : { destination: newX, duration: 0 };
-			momentumY = this.hasVerticalScroll ? utils.momentum(this.y, this.startY, duration, this.maxScrollY, this.options.bounce ? this.wrapperHeight : 0, this.options.deceleration) : { destination: newY, duration: 0 };
+		// start momentum animation if needed (use interval-based duration)
+		if ( this.options.momentum && durationSinceInterval < 300 ) {
+			momentumX = this.hasHorizontalScroll ? utils.momentum(this.x, this.startX, durationSinceInterval, this.maxScrollX, this.options.bounce ? this.wrapperWidth : 0, this.options.deceleration) : { destination: newX, duration: 0 };
+			momentumY = this.hasVerticalScroll ? utils.momentum(this.y, this.startY, durationSinceInterval, this.maxScrollY, this.options.bounce ? this.wrapperHeight : 0, this.options.deceleration) : { destination: newY, duration: 0 };
 			newX = momentumX.destination;
 			newY = momentumY.destination;
 			time = Math.max(momentumX.duration, momentumY.duration);
@@ -681,7 +718,7 @@ IScroll.prototype = {
 					Math.max(
 						Math.min(Math.abs(newX - snap.x), 1000),
 						Math.min(Math.abs(newY - snap.y), 1000)
-					), 300);
+					), 1000);
 			newX = snap.x;
 			newY = snap.y;
 
@@ -692,10 +729,37 @@ IScroll.prototype = {
 
 // INSERT POINT: _end
 
+		// Custom scrollFit behavior: align to list items (~114px) using fuzzyDirection
+		if ( this.options.scrollFit ) {
+			// clamp upwards
+			if ( newY > 0 ) {
+				newY = 0;
+			}
+			var idx = - (newY / 114) | 0;
+			var b = 114 * -idx;
+			var a = 114 * -(idx + 1);
+			var k = Math.abs(b - newY);
+			// determine nearest snap with fuzzy direction influence
+			this.newY = (this.fuzzyDirectionY > 0) ? (k > 30 ? a : b) : (k < 84 ? b : a);
+			this.newX = newX;
+			this.listIndex = Math.abs(this.newY / 114);
+			this.moveTime = time < 100 ? 300 : time;
+			this._execEvent('setNewPosition');
+			// use newY as the final y for scrolling
+			newY = this.newY;
+			// adjust time to use moveTime if set
+			time = this.moveTime ? this.moveTime : time;
+		}
+
 		if ( newX != this.x || newY != this.y ) {
 			// change easing function when scroller goes out of the boundaries
 			if ( newX > 0 || newX < this.maxScrollX || newY > 0 || newY < this.maxScrollY ) {
 				easing = utils.ease.quadratic;
+			}
+
+			// ensure reasonable minimum timing when using transitions
+			if ( time < 100 ) {
+				time = time ? time : 70;
 			}
 
 			this.scrollTo(newX, newY, time, easing);
@@ -737,7 +801,21 @@ IScroll.prototype = {
 			return false;
 		}
 
-		this.scrollTo(x, y, time, this.options.bounceEasing);
+		// Enhanced list-aware logic when vertical bounds exceeded
+		var tx = x, ty = y, t = time;
+		if (!this.hasVerticalScroll || this.y > 0) {
+			this.listIndex = this.newY = ty = 0;
+			this._execEvent('setNewPosition');
+		} else if ( this.y < this.maxScrollY ) {
+			ty = this.maxScrollY;
+			var e = -(ty / 114) | 0;
+			this.newY = ty;
+			this.listIndex = 60 > -(ty % 114) ? e : e + 1;
+			this._execEvent('ajaxScrollStart');
+			this._execEvent('setNewPosition');
+		}
+
+		this.scrollTo(tx, ty, t, this.options.bounceEasing);
 
 		return true;
 	},
@@ -794,11 +872,13 @@ IScroll.prototype = {
 				this.wrapper.style[utils.style.touchAction] = utils.getTouchAction(this.options.eventPassthrough, false);
 			}
 		}
-		this.wrapperOffset = utils.offset(this.wrapper);
 
-		this._execEvent('refresh');
-
-		this.resetPosition();
+		// Conditional refresh: skip heavy recalculation if external flag present
+		if (1 != window.scrollFlag) {
+			this.wrapperOffset = utils.offset(this.wrapper);
+			this._execEvent('refresh');
+			this.resetPosition();
+		}
 
 // INSERT POINT: _refresh
 
